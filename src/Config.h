@@ -82,6 +82,10 @@ static const char TOPIC_BASE[]      PROGMEM = "garage/light";
 //   Lua dat.brok-offline sets `…/<clntid>/state` with value "OFF".
 //   Birth (online) = "ON" with retain=1.
 //   See main/mqttset.lua and main/mqttget.lua.
+//
+// We pass these into PubSubClient APIs that take `const char*` — keeping
+// them as plain `const char[]` (not PROGMEM-wrapped) avoids an extra
+// `__FlashStringHelper*` cast at every call site.
 // ---------------------------------------------------------------------------
-static const char LWT_PAYLOAD_OFFLINE[] PROGMEM = "OFF";
-static const char LWT_PAYLOAD_ONLINE[]  PROGMEM = "ON";
+static const char LWT_PAYLOAD_OFFLINE[] = "OFF";
+static const char LWT_PAYLOAD_ONLINE[]  = "ON";

@@ -32,5 +32,7 @@ public:
 
 private:
     static bool _ready;
-    static void emit(char levelChar, const char* module, const String& payload);
+    static void emit(char levelChar,
+                     const __FlashStringHelper* module,
+                     const String& payload);
 };

@@ -90,8 +90,7 @@ bool MqttClient::connectBroker() {
         /*willQos*/ 0,
         /*willRetain*/ true,
         /*willMsg*/ LWT_PAYLOAD_OFFLINE,
-        /*cleanSession*/ true,
-        MQTT_KEEPALIVE_S);
+        /*cleanSession*/ true);
 
     if (!ok) {
         String s = F("rc=");
@@ -112,7 +111,7 @@ void MqttClient::announceOnline() {
     // is actually QoS 2 with retain 1; with our buffer 512 this fits, but
     // QoS 1 keeps the broker calmer when paired with low MQTT_PING jitter).
     String topic = g_state.nodetopic + "/state";
-    _mqtt->publish(topic.c_str(), LWT_PAYLOAD_ONLINE, 1, true);
+    _mqtt->publish(topic.c_str(), LWT_PAYLOAD_ONLINE, /*retained*/ true, /*qos*/ 1);
 }
 
 void MqttClient::subscribeAll() {
@@ -144,7 +143,8 @@ void MqttClient::subscribeAll() {
 bool MqttClient::publishConnected(const String& topic, const String& payload,
                                   uint8_t qos, bool retain) {
     if (!connected()) return false;
-    return _mqtt->publish(topic.c_str(), payload.c_str(), qos, retain);
+    // PubSubClient's string + string + retain + qos overload:
+    return _mqtt->publish(topic.c_str(), payload.c_str(), retain, qos);
 }
 
 PubSubClient& MqttClient::raw() { return *_mqtt; }

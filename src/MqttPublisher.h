@@ -4,10 +4,7 @@
 // by `mqttpub.lua`. Used to serialize publish() calls so they keep order
 // over the single MQTT socket.
 //
-// Per publish we attach an optional `isJson` flag — kept for the
-// iteration where we publish the state JSON to the per-device state
-// topic. Topic is built as `garage/light/<leaf>` (Lua `dat.topic .. '/' ..
-// tp[1]`).
+// Topic is built as `garage/light/<leaf>` (Lua `dat.topic .. '/' .. tp[1]`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #pragma once
@@ -34,9 +31,17 @@ private:
         bool   retain;
     };
 
+    // Ring-buffer is owned by the class instead of a TU-static so the
+    // declaration order between `Item` and `s_queue[]` is unambiguous.
+    static constexpr size_t QUEUE_CAPACITY = 16;
+    Item        _q[QUEUE_CAPACITY];
+    size_t      _qHead = 0;     // index of oldest
+    size_t      _qTail = 0;     // index of next-slot
+    size_t      _qSize = 0;
+
     MqttClient* _mqtt = nullptr;
-    Item        _head;          // holds the packet currently being sent
     bool        _headInFlight = false;
+    Item        _head;
 
     void releaseHead();
 };

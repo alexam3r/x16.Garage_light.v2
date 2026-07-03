@@ -4,73 +4,56 @@
 #include "MqttClient.h"
 #include "State.h"
 #include "Config.h"
-
-namespace {
-// Static queue — we hold at most one item in flight plus any pending
-// arrivals. Sized tight on purpose: ESP8266 RAM budget.
-constexpr size_t QUEUE_CAPACITY = 16;
-Item   s_queue[QUEUE_CAPACITY];
-size_t s_qHead = 0;     // index of oldest
-size_t s_qTail = 0;     // index of next-slot
-size_t s_qSize = 0;
-
-bool enqueueSlot(const Item& item) {
-    if (s_qSize >= QUEUE_CAPACITY) {
-        // Drop oldest — equivalent to Lua's table.remove rolling
-        // behaviour. Counterpart: we want recent telemetry to win
-        // diagnostics over stale state when buffer pressure is high.
-        s_qHead = (s_qHead + 1) % QUEUE_CAPACITY;
-        s_qSize--;
-    }
-    s_queue[s_qTail] = item;
-    s_qTail = (s_qTail + 1) % QUEUE_CAPACITY;
-    ++s_qSize;
-    return true;
-}
-
-bool dequeueSlot(Item& out) {
-    if (s_qSize == 0) return false;
-    out = s_queue[s_qHead];
-    s_qHead = (s_qHead + 1) % QUEUE_CAPACITY;
-    --s_qSize;
-    return true;
-}
-}  // namespace
+#include "Logger.h"
 
 void MqttPublisher::begin(MqttClient& mqtt) {
     _mqtt = &mqtt;
-    s_qHead = s_qTail = s_qSize = 0;
+    _qHead = _qTail = _qSize = 0;
     _headInFlight = false;
+    _head = Item{};
 }
 
 void MqttPublisher::enqueue(const String& leaf, const String& payload,
                             uint8_t qos, bool retain) {
+    // Drop oldest on overflow — equivalent to a rolling log; recent
+    // telemetry beats stale state when buffer pressure is high.
+    if (_qSize >= QUEUE_CAPACITY) {
+        _qHead = (_qHead + 1) % QUEUE_CAPACITY;
+        --_qSize;
+        Logger::warn(F("pub"), F("queue full, dropping oldest"));
+    }
     Item it;
     it.leaf    = leaf;
     it.payload = payload;
     it.qos     = qos;
     it.retain  = retain;
-    enqueueSlot(it);
+    _q[_qTail] = it;
+    _qTail = (_qTail + 1) % QUEUE_CAPACITY;
+    ++_qSize;
 }
 
 void MqttPublisher::tick() {
     if (!_mqtt) return;
 
-    // In PubSubClient world, a publish call is queued into TCP buffers
-    // synchronously; only one write should be outstanding per tick.
+    // In PubSubClient world a publish call is queued into TCP buffers
+    // synchronously; only one write is "in flight" per tick. The flag is
+    // dropped on the next tick, after PubSubClient::loop() (driven by
+    // MqttClient::tick() one step earlier) has had its chance to drain.
     if (_headInFlight) {
         _headInFlight = false;
-        // Allow PubSubClient's loop() (driven by MqttClient::tick()) to
-        // drain any ack before we send the next packet. We simply clear
-        // the flag here. (Equivalent to Lua `punow()` callback tail.)
     }
 
+    if (_qSize == 0) return;
+
     // Take the next item.
-    Item next;
-    if (!dequeueSlot(next)) return;
+    Item next = _q[_qHead];
+    _qHead = (_qHead + 1) % QUEUE_CAPACITY;
+    --_qSize;
+
     if (!_mqtt->connected()) {
         // No broker — put it back at the head and wait.
-        enqueueSlot(next);
+        _qHead = (_qHead == 0) ? QUEUE_CAPACITY - 1 : _qHead - 1;
+        ++_qSize;
         return;
     }
 
@@ -82,8 +65,9 @@ void MqttPublisher::tick() {
         _head = next;
         _headInFlight = true;
     } else {
-        // Publish failed (likely overflow of ESP8266 TX buffer) — requeue.
-        enqueueSlot(next);
+        // Publish failed (likely TCP TX buffer full) — requeue at the head.
+        _qHead = (_qHead == 0) ? QUEUE_CAPACITY - 1 : _qHead - 1;
+        ++_qSize;
     }
 }
 

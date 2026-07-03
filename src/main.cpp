@@ -24,6 +24,8 @@
 // (Wifi, Mqtt, Publisher, Dispatch, Light) are composed here so that
 // the wiring diagram matches `main.lua`'s boot chain.
 
+namespace {
+
 WifiManager      g_wifi;
 MqttPublisher    g_publisher;
 MqttClient       g_mqtt;
