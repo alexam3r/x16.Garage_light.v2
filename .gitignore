@@ -1,2 +1,20 @@
+# Legacy CAD artefacts (Altium / Fusion 360 export)
 Altium
 light.crv3d
+
+# PlatformIO build artefacts
+.pio/
+.vscode/
+.platformio/
+
+# IDE / editor caches
+*.swp
+*.bak
+*~
+
+# ESP8266 build outputs (when building without PIO)
+build/
+firmware.bin
+
+# Secrets — only Secrets.h.sample is tracked
+src/Secrets.h
