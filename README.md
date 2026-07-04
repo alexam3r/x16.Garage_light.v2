@@ -1,186 +1,188 @@
 # x16.Garage\_light.v2 — прошивка на C++ (в разработке)
 
-Прошивка ESP8266 (NodeMCU) на Arduino/PlatformIO для контроллера света в гараже —
-переписывание оригинальной прошивки на Lua (`main/*.lua`) на C++.
+ESP8266 (NodeMCU) на Arduino/PlatformIO. Контроллер света в гараже:
+основное освещение (Main, GPIO5), декоративные Edison (GPIO6),
+датчик движения (PIR на GPIO7), температура/влажность (AM2320 по I²C).
+Управляется через MQTT с интеграцией Home Assistant.
 
-> **Статус: в разработке.** Целевая структура описана, файлы ещё не созданы.
-> Это README — контракт того, что появится в `src/`.
+> **Структура MQTT пересмотрена** — старая Lua-плоскость (`dat.light`,
+> `dat.lightMoveDetection`, …) больше не применяется как спецификация. Дерево
+> проектировалось под Home Assistant: один корень `garage/light/…`, единый
+> JSON status под `…/status`, LWT/availability отдельным топиком,
+> команды в виде **`<thing>/{set,state}`** — стандартное HA-соглашение.
 
-## Что сейчас лежит в репозитории
+## Что в репозитории
 
 ```
 .
-├── CLAUDE.md                  # краткое описание проекта для будущих сессий Claude Code
+├── CLAUDE.md                  # краткое описание проекта
 ├── README.md                  # этот файл
-├── .gitignore                 # исключает CAD-артефакты, secrets.h, сборку PIO
-├── platformio.ini              # (пока нет — будет добавлен)
+├── .gitignore                 # CAD-артефакты, .pio/, src/secrets.h
+├── platformio.ini             # target env:nodemcu
 ├── docs/
-│   └── lua-original/           # Lua-версия, сохраняется как reference
-│       ├── init.lua
-│       ├── setglobals.lua
-│       ├── mqttset.lua
-│       ├── mqttget.lua
-│       ├── mqttanalise.lua
-│       ├── mqttpub.lua
-│       ├── main.lua
-│       └── check\_air\_temp.lua
-└── src/                       # новая прошивка на C++ (будет создана)
+│   └── lua-original/          # оригинал на Lua — архивный reference
+│       └── *.lua
+└── src/                       # прошивка на C++ (вся в одном файле)
+    ├── main.cpp               # setup()/loop() + все классы
+    ├── Config.h               # компиле-тайм флаги, пины, имена топиков
+    ├── Secrets.h.sample       # шаблон кредами — лежит в git
+    └── Secrets.h              # копия с реальными данными — **НЕ в git**
 ```
-
-`docs/lua-original/` — оригинальная NodeMCU-прошивка на Lua, оставляется как
-референс на время перехода на C++. **Файлы `.lua` там редактировать не надо** —
-они только для сверки при переводе на C++.
 
 ## Железо
 
 - **Плата:** ESP8266 NodeMCU v2 (≈80 КБ ОЗУ, доступных приложению).
-- **Распиновка** (совпадает с оригинальной Lua-прошивкой):
+- **Распиновка:**
 
-  | Пин | Функция                                              |
-  | --- | ---------------------------------------------------- |
-  | D5  | GPIO5 — `pinLightMain` (основное освещение)          |
-  | D6  | GPIO6 — `pinLightEdison` (декоративные лампы)        |
-  | D7  | GPIO7 — `pinPIR` (датчик движения, прерывание)       |
-  | D1  | GPIO2 — I²C SDA → AM2320                             |
-  | D2  | GPIO4 — I²C SCL → AM2320                             |
+  | Пин | Функция                                          |
+  | --- | ------------------------------------------------ |
+  | D5  | GPIO5 — `pinLightMain` (основное освещение)      |
+  | D6  | GPIO6 — `pinLightEdison` (декоративные Edison)    |
+  | D7  | GPIO7 — `pinPIR` (датчик движения, прерывание)   |
+  | D1  | GPIO2 — I²C SDA → AM2320                         |
+  | D2  | GPIO4 — I²C SCL → AM2320                         |
 
-- **AM2320** на шине I²C (SDA=`D1`, SCL=`D2`). Драйвер будит датчик и читает
-  регистры 0x0000/0x0001 по даташиту; ошибки уходят в поле `message` JSON,
-  а наружу — топик `garage/light/<clntid>/message`.
+- **AM2320** подключён к I²C. Драйвер будит датчик и читает регистры
+  0x0000/0x0001 по даташиту; ошибки уходят в поле `message` JSON.
 
-## Поведение
+## MQTT: дерево топиков
 
-Прошивка повторяет логику оригинала на Lua:
+Корень — `garage/light`. Один комплект в гараже — `clntid` в топиках
+**не используется**, всё под корнем напрямую. Всё управление идёт через пары
+`<leaf>/{set,state}` в стиле Home Assistant: подписаться на `…/<leaf>/set`
+для приёма команд, опубликовать состояние в `…/<leaf>/state`.
 
-- На старте: подключение к Wi-Fi (последняя сохранённая сеть), затем к MQTT-брокеру.
-- Подписка на управляющие топики, публикация availability (`online`) и
-  discovery-конфигов Home Assistant при первом успешном коннекте.
-- 1‑Гц таймер публикует диагностику (uptime, heap, RSSI, IP) и раз в минуту
-  опрашивает `Am2320::read()`.
+### Управление
 
-### Что реализовано в текущей итерации
-
-В этой первой портирующей итерации сделано:
-
-- ✅ Подключение к Wi-Fi и MQTT с LWT (`…/<clntid>/state`, retain=true).
-- ✅ Подписки на `garage/light/light`, `…/lightNow`, `…/lightSelected`,
-   `…/lightMoveDetection`, `…/<clntid>/ide`, `…/<clntid>/restart`.
-- ✅ Обработка команды `garage/light/light` = `ON|OFF` — через
-   `MqttDispatch` → `LightController::onLightCommandStatic` →
-   `gpio.write(GPIO5, …)`.
-- ✅ Авто-выключение через 600 с (после движения) или 3600 с (после команды
-   MQTT).
-- ✅ Публикация `<clntid>/heap` и `<clntid>/uptime` каждые 60 тиков
-   (диагностика).
-- ✅ Legacy plain-топики `garage/light/light`, `…/lightNow` сохраняются.
-
-Что **НЕ** реализовано:
-
-- ❌ Home Assistant discovery — пока legacy plaintext tree.
-- ❌ AM2320 (температура/влажность).
-- ❌ PIR-прерывание (motion → turn light ON).
-- ❌ Select MAIN/EDISON (сейчас только MAIN, GPIO5).
-- ❌ HTTP-recovery / OTA-updates.
-- ❌ Watchdog.
-- ❌ Единый JSON state-topic.
-
-Все эти пункты включаются флагами `CFG_ENABLE_*` в `src/Config.h` — оставляем
-их в 0 до следующих итераций.
-
-### Управление светом
-
-- В любой момент активен ровно один источник: **MAIN** (GPIO5) или **EDISON** (GPIO6).
-- Переключение режима — через select в Home Assistant
-  `select.garage_light_x16_mode` (подписка на тот же логический топик
-  `garage/light/lightSelected`, что и в Lua-оригинале).
-- Датчик движения включает свет по текущему активному источнику:
-  - в режиме MAIN поднимает GPIO5;
-  - в режиме EDISON оригинальный код всё равно поднимает GPIO5 («вспышка на движение»).
-    C++-порт сохраняет это поведение и публикует событие через поле
-    `motion_event` в JSON state-topic.
-- Таймер авто-выключения: при включении от датчика движения `lightTimeout = 600 с`;
-  при включении по MQTT таймер перекрывается на `3600 с`.
-- Длинный grace-таймер (`moveDetectionTimout = 6 870 947 мс ≈ 1 ч 54 м`):
-  когда принудительно выключили датчик (`lightMoveDetection=OFF`), PIR снова
-  включается через этот интервал.
+| Топик                            | Тип                    | Описание                                                |
+| -------------------------------- | ---------------------- | ------------------------------------------------------- |
+| `garage/light/light/set`         | in (sub)               | Команда `ON` / `OFF` — включить/выключить активный источник. Какой именно — определяется текущим `mode`. |
+| `garage/light/light/state`       | out (retained)         | Текущее состояние `ON` / `OFF`.                         |
+| `garage/light/mode/set`          | in (sub)               | Выбор источника для следующего включения: `MAIN` / `EDISON` / `OFF` (`OFF` — оба выключены и «никакой следующей команды не включает»). |
+| `garage/light/mode/state`        | out (retained)         | Текущий режим (тот же набор значений).                  |
+| `garage/light/motion/set`        | in (sub)               | `ON` / `OFF` — вкл/выкл режим авто-включения от PIR.   |
+| `garage/light/motion/state`      | out (retained)         | Текущее состояние `ON` / `OFF`.                          |
+| `garage/light/restart/set`       | in (sub)               | Команда `RESTART` или `PRESS` — перезагрузка МК.        |
 
 ### Телеметрия
 
-**Один retained JSON state-topic** публикуется на каждом heartbeat, в котором
-что-то поменялось:
+| Топик                            | Тип               | Описание                                                  |
+| -------------------------------- | ----------------- | --------------------------------------------------------- |
+| `garage/light/status`            | out (retained, JSON) | Сводка состояния публикуется раз в минуту и при изменениях. Подробный формат ниже. |
+| `garage/light/availability`      | out (retained)   | `online` / `offline`. LWT-birth публикует `online` с retain при коннекте; LWT публикует `offline` если брокер потерял связь. |
 
-```
-garage/light/<clntid>/state
-```
+### Формат `…/status` (JSON)
 
-Схема (имена полей совпадают с ключами `value_template` в HA discovery):
-
-```jsonc
+```json
 {
-  "ip":          "10.0.2.123",
-  "heap":        12345,
-  "uptime":      12345,
-  "rssi":        -61,
-  "air\_temp":   22.4,        // °C
-  "hum":         45.1,        // %
-  "light":       "ON",        // зеркало оригинального garage/light/light
-  "light\_now":  "ON",        // зеркало garage/light/lightNow
-  "mode":        "MAIN",      // MAIN | EDISON
-  "motion":      "ON",        // зеркало garage/light/lightMoveDetection (ON = охрана включена)
-  "manual\_on":  false,       // true если свет включён по MQTT, не движением
-  "message":     ""           // последняя ошибка (очищается на успешной операции)
+  "available": true,
+  "uptime_s":  12345,
+  "rssi":     -61,
+  "ip":       "10.0.2.123",
+  "mode":     "MAIN",
+  "temp_c":    22.4,
+  "hum_pct":   45.1
 }
 ```
 
-`<clntid>` — это `node.chipid()` (как в оригинале).
+Что **не** включено и почему:
 
-### Интеграция с Home Assistant
+- `ts` (unix-time) — убран, потому что `uptime_s` уже фиксирует порядок событий.
+- `heap` — исключён: на ESP8266 после `wifi.begin` диагностика фрагментации
+  памяти даёт шумные цифры; пользователю интереснее `uptime` и `rssi`.
+- `light_main`/`light_edison` как отдельные поля — убраны: один источник
+  света управляется через `…/light/{set,state}`, и `mode` уже говорит, какой.
 
-На первом успешном коннекте прошивка публикует retain'ом discovery-конфиги
-в следующие топики:
+### Дерево не содержит `<clntid>`
 
-| Топик | Сущность |
-| --- | --- |
-| `homeassistant/light/garage_light_x16_*/config` | Свет (управление + состояние) |
-| `homeassistant/select/garage_light_x16_*/config` | Mode select MAIN/EDISON |
-| `homeassistant/binary_sensor/garage_light_x16_*/config` | Состояние датчика движения |
-| `homeassistant/sensor/garage_light_x16_*/config` | Температура воздуха |
-| `homeassistant/sensor/garage_light_x16_*/config` | Влажность |
-| `homeassistant/sensor/garage_light_x16_*/config` | Heap, uptime, RSSI (`entity_category:"diagnostic"`) |
+Оставляем плоское дерево в корне `garage/light/…` — в текущей инсталляции
+один МК в гараже. Если в будущем появится второе устройство, имеет смысл
+обратно перейти к `garage/light/<id>/…`, но тогда нужно задуматься и про
+HA-`unique_id`, и про миграцию retained-топиков — это отдельный этап.
 
-Все сущности принадлежат одному HA-устройству:
-`identifiers = [<clntid>]` (chip ID), `name = "Garage Light x16"`,
-`sw = "<version проекта>"`.
+## Поведение
 
-Availability — отдельный топик
-`garage/light/<clntid>/availability` (`online`/`offline`),
-LWT — `…/state` со значением `OFFLINE`, чтобы HA показывал устройство
-недоступным при потере связи.
+- **Старт.** Подключаемся к Wi-Fi сети из `Secrets.h`, затем к MQTT-брокеру.
+  На первом коннекте публикуем retain: discovery-конфиги HA, `…/availability`
+  = `online`, `…/light/state`, `…/mode/state`, `…/motion/state` — всё текущее
+  состояние.
+- **Heartbeat (1 Гц).** Внутри обновляет счётчик. Каждые 60 тиков (≈раз в минуту)
+  пересобирает JSON `…/status` и публикует.
+- **PIR (HC-SR501 на GPIO7).** Прерывание по фронту `RISING`. PIR триггерит
+  **активный** источник: если `mode = MAIN`, поднимает Main; если `mode =
+  EDISON`, поднимает Edison. Если `mode = OFF` или motion_disarmed, PIR
+  ничего не делает.
+  Семантика таймера у PIR:
+  - если свет выключен → PIR включает его с таймером `LIGHT_TIMEOUT_MOTION_MS
+    = 600 000` (10 минут);
+  - если свет уже горит и активный таймер — тоже motion‑источник → PIR
+    продлевает таймер до 10 минут от события (стандартное поведение детектора);
+  - если свет уже горит и активный таймер — `MQTT`‑источник → PIR event
+    **игнорируется**. PIR не имеет права уменьшать таймер, установленный
+    вручную через MQTT.
+- **MQTT-команда `…/light/set = ON`.** Поднимает текущий источник по `mode`,
+  таймер `LIGHT_TIMEOUT_MQTT_MS = 3 600 000` (1 час). PIR затем не меняет
+  этот таймер (см. выше).
+- **Авто-выключение.** Когда сработал таймер (motion-10 мин или mqtt-1 час),
+  оба GPIO выключаются, `…/light/state` = `OFF`.
+- **После выключения происходит две вещи:** `mode` всегда сбрасывается на
+  `MAIN` (вне зависимости от того, какой источник работал и по какой причине
+  произошло выключение — MQTT-OFF, авто-таймаут или `mode=OFF` через селектор);
+  внутренний флаг `_fromMotion` сбрасывается — следующий PIR-триггер снова
+  назначит10-минутный таймер, как и должно быть.
+- **RESTART.** По `…/restart/set` → `ESP.restart()`.
 
-## Структура проекта
+## Home Assistant — discovery
 
+На первом MQTT-коннекте публикуем **retain** следующие config-топики
+HA в стандартной форме `homeassistant/<platform>/garage_light_<entity>/config`:
+
+| Топик discovery                                              | Сущность                 | Источник данных                                  |
+| ------------------------------------------------------------ | ------------------------ | ------------------------------------------------ |
+| `homeassistant/light/garage_light/config`                    | `light.garage_light`     | `…/light/{state,set}`                            |
+| `homeassistant/select/garage_light_mode/config`              | `select.garage_light_mode` | `…/mode/{state,set}`, options = `[MAIN, EDISON, OFF]` |
+| `homeassistant/binary_sensor/garage_light_motion/config`     | `binary_sensor.garage_light_motion` | `…/motion/state`, `device_class:motion` |
+| `homeassistant/button/garage_light_restart/config`           | `button.garage_light_restart`    | `…/restart/set`, payload `RESTART`        |
+| `homeassistant/sensor/garage_light_temperature/config`       | `sensor.garage_light_temperature` | `…/status`, `value_template: "{{ value_json.temp_c }}"` |
+| `homeassistant/sensor/garage_light_humidity/config`          | `sensor.garage_light_humidity`    | `…/status`, `value_template: "{{ value_json.hum_pct }}"` |
+
+…и три диагностических сенсора с `entity_category: diagnostic`:
+
+| Топик discovery                                              | Сущность                          | value_template                          |
+| ------------------------------------------------------------ | --------------------------------- | --------------------------------------- |
+| `homeassistant/sensor/garage_light_uptime/config`            | `sensor.garage_light_uptime`      | `{{ value_json.uptime_s }}`            |
+| `homeassistant/sensor/garage_light_rssi/config`              | `sensor.garage_light_rssi`        | `{{ value_json.rssi }}` (`device_class: signal_strength`) |
+| `homeassistant/sensor/garage_light_ip/config`                | `sensor.garage_light_ip`          | `{{ value_json.ip }}`                  |
+
+Все сущности описаны через один HA-`device`:
+
+```jsonc
+"device": {
+  "identifiers": ["garage_light_x1_6"],   // стабильный unique-id по MKT + модели
+  "name":       "Garage Light x16",
+  "model":      "esp8266-nodemcu",
+  "sw_version": "<semver проекта>"
+}
 ```
-src/
-├── main.cpp                    # setup() + loop()
-├── Config.h                    # пины, дерево топиков, рантайм-дефолты (без секретов)
-├── Secrets.h                   # креды Wi-Fi + MQTT — **НЕ В GIT**
-├── Secrets.h\.sample           # шаблон, который коммитим
-├── State.{h,cpp}               # структура глобального состояния (бывший `dat` в Lua)
-├── WifiManager.{h,cpp}         # авто-коннект / реконнект к Wi-Fi
-├── MqttClient.{h,cpp}          # connect/reconnect MQTT, LWT, availability
-├── MqttDispatch.{h,cpp}        # входящий топик → таблица хендлеров
-├── MqttPublisher.{h,cpp}       # FIFO исходящих публикаций + punow-сериализация
-├── HaDiscovery.{h,cpp}         # публикация HA discovery JSON
-├── Telemetry.{h,cpp}           # сборка JSON-документа состояния
-├── LightController.{h,cpp}     # light(), moveDetected(), таймеры
-├── Am2320.{h,cpp}              # I²C-драйвер AM2320 (WAKE + read)
-├── HttpRecovery.{h,cpp}        # OTA + HTTP-recovery (флаг rtcmem из Lua сохранён)
-└── Logger.{h,cpp}              # обёртка serial-логирования
-```
+
+`availability_topic` для всех entity — `garage/light/availability`,
+`payload_available = "online"`, `payload_not_available = "offline"`.
+Это позволяет HA показывать устройство как «недоступно» при потере
+связи с брокером (PubSubClient LWT публикует `offline` по таймауту
+keepalive).
+
+### Как это ведёт себя в Lovelace
+
+- Карточка `light.garage_light` — главная лампа. Кнопка вкл/выкл, иконка
+  меняется в зависимости от `…/light/state`.
+- Рядом select для режима — пользователь переключает между MAIN/EDISON/OFF.
+- В карточке настроек — binary_sensor `motion` (включена ли PIR-охрана),
+  диагностические сенсоры (uptime/RSSI/IP) разворачиваются в development‑секции.
+- Кнопка `button.garage_light_restart` — в development‑секции.
 
 ## Конфигурация
 
-### Секреты (`Secrets.h`)
+### Secrets (`src/Secrets.h`)
 
 Шаблон коммитится как `src/Secrets.h.sample`. Копируем в `src/Secrets.h`
 и заполняем:
@@ -194,31 +196,27 @@ src/
 #define MQTT_PORT      1883
 ```
 
-`Secrets.h` добавляется в `.gitignore` — в репозитории лежит **только**
-`Secrets.h.sample`.
+`Secrets.h` в `.gitignore` — в репозитории только sample.
 
-### Дефайны времени компиляции (`Config.h`)
+### Дефайны времени компиляции (`src/Config.h`)
 
-Переключатели поведения без правки логики:
+Дефолты рассчитаны на новую структуру:
 
-- `CFG_ENABLE_HA_DISCOVERY`     → по умолчанию `1`
-- `CFG_ENABLE_AM2320`            → по умолчанию `1`
-- `CFG_PUBLISH_LEGACY_TOPICS`    → по умолчанию `1` (публикует оригинальные
-  plain-string топики `garage/light/airTemp`, `…/hum`, `…/light`,
-  `…/lightNow`, `…/lightSelected`, `…/lightMoveDetection` — для пользователей
-  вне Home Assistant).
-- `CFG_PUBLISH_TELEMETRY_JSON`   → по умолчанию `1` (один JSON state-topic).
-- `CFG_ENABLE_HTTP_RECOVERY`     → по умолчанию `1` (сохраняет поведение Lua:
-  rtcmem-флаг срабатывает и из MQTT-сообщения `…/ide`).
+- `CFG_ENABLE_HA_DISCOVERY`    → по умолчанию `1` — discovery публикуется при первом коннекте.
+- `CFG_ENABLE_AM2320`           → по умолчанию `1` — сенсор температуры/влажности.
+- `CFG_PUBLISH_STATUS_JSON`     → по умолчанию `1` — JSON `…/status` раз в минуту.
+- `CFG_ENABLE_HTTP_RECOVERY`    → по умолчанию `0` — опционально, при включении
+   поднимает HTTP-сервер для восстановления и/или OTA (следующая итерация).
+- `CFG_PUBLISH_LEGACY_TOPICS`   → по умолчанию `0` — старые Lua-топики (`airTemp`,
+   `hum`, `lightSelected`, …) НЕ публикуются. Эта ситуация — отказ от
+   legacy-формата.
 
 ## Как собирать / прошивать
-
-Таргет PlatformIO объявлен в `platformio.ini`:
 
 ```bash
 # 0. Сконфигурировать креды.
 cp src/Secrets.h.sample src/Secrets.h
-# отредактировать src/Secrets.h, заполнив WIFI_SSID/WIFI_PASSWORD/...
+# отредактировать src/Secrets.h: WIFI_SSID / WIFI_PASSWORD / MQTT_USER / …
 
 # 1. Сборка (артефакты в .pio/).
 pio run
@@ -228,7 +226,7 @@ pio run -t upload
 
 # 3. Serial-монитор.
 pio device monitor
-#   → должны появиться:
+#   должны появиться:
 #      [I][…][boot] starting x16 garage light
 #      [I][…][wifi] connecting to '<SSID>'
 #      [I][…][wifi] connected, ip=10.0.x.y
@@ -236,57 +234,45 @@ pio device monitor
 #      [I][…][mqtt] subscribed
 ```
 
-После прошивки проверить, что MQTT-команды работают:
+После прошивки проверить взаимодействие вручную:
 
 ```bash
-# Выключено по умолчанию.
-mosquitto_sub -h <broker> -t 'garage/light/#' -v &
-# Потянуть свет:
-mosquitto_pub -h <broker> -t 'garage/light/light' -m ON
-# Опустить свет:
-mosquitto_pub -h <broker> -t 'garage/light/light' -m OFF
+# Включаемся с режимом MAIN, ON.
+mosquitto_pub -h <broker> -t 'garage/light/mode/set'  -m MAIN
+mosquitto_pub -h <broker> -t 'garage/light/light/set' -m ON
+
+# Видим retained:
+# garage/light/light/state ON
+# garage/light/mode/state MAIN
+# garage/light/status {"available":true, ...}
+
+# Переключаемся на Edison и оставим ON.
+mosquitto_pub -h <broker> -t 'garage/light/mode/set'  -m EDISON
+mosquitto_pub -h <broker> -t 'garage/light/light/set' -m ON
+# → GPIO6 (Edison) поднимается, GPIO5 (Main) опускается.
+
+# Выключаем всё.
+mosquitto_pub -h <broker> -t 'garage/light/light/set' -m OFF
+
+# В Home Assistant: добавляем MQTT integration, он найдёт
+# все entity по discovery config-топикам автоматически.
 ```
 
-После команды ON должны придти retained-сообщения `…/light ON` и
-`…/lightNow ON`; реле на GPIO5 — включиться; через 60 минут
-(после MQTT-ON) или 10 минут (после движения, сейчас не срабатывает —
-PIR ещё не подключён) свет выключится автоматически.
+## Что осталось за рамками этой итерации
 
-## Что сохраняется из оригинала на Lua
+- **OTA + HTTP-recovery** (`CFG_ENABLE_HTTP_RECOVERY = 1`).
+- **Аппаратный watchdog** — перезагрузка при зависании.
+- **TLS для MQTT** (сейчас брокер в доверенной LAN).
 
-- Распиновка, дерево топиков (`garage/light`), MQTT-клиент на `chipid()`,
-  таймеры авто-выключения (600 с / 3600 с override / `moveDetectionTimout = 6870947` мс).
-- HA-friendly JSON state **дополняет** оригинальные топики — оба могут сосуществовать.
+## Открытые вопросы / TODO
 
-## Что меняется
-
-- Код на C++17, собирается через PlatformIO / ESP8266 Arduino Core.
-- Doxygen-совместимое разделение на модули вместо одного `_G` namespace.
-- Все чувствительные константы — в `Secrets.h` (в `.gitignore`),
-  `Secrets.h.sample` — единственный шаблон креда в git.
-- Логирование — через единый `Logger` вместо ad-hoc `print()`.
-- Lua recovery-режим (`rtcmem.write32(0,501)`) сохранён: срабатывает по
-  MQTT-команде `…/ide` и поднимает `HttpRecovery`.
-- В этой первой итерации актуальный путь к актуальной прошивке — `src/`.
-  Lua-исходники переехали в `docs/lua-original/` и не редактируются
-  (это reference, не активный код).
-
-## Вне рамок задачи (сейчас)
-
-- Проверка целостности прошивки на первом старте (планируется в `HttpRecovery::loop`).
-- TLS для MQTT (в Lua брокер в доверенной LAN).
-
-## Открытые вопросы / TODO перед началом кода
-
-Это не вошло в ответы выше и остаётся открытым — задокументировано, чтобы
-вернуться на этапе реализации:
-
-1. **Поведение датчика движения в режиме EDISON:** оставляем как в Lua
-   (PIR поднимает MAIN даже когда режим EDISON — «вспышка на движение»),
-   или меняем на «PIR триггерит только активный источник»? Дефолт в README —
-   сохраняем Lua-поведение.
-2. **Watchdog:** включать ли аппаратный watchdog ESP и перезагружать на зависании.
-   Дефолт — да, после `k` секундный таймаут.
-3. **Размер discovery payload:** если payload для light-entity превысит
-   512 Б (не должен, ожидается ~480), публиковать облегчённую версию
-   (без `effect_list` и т. п.).
+1. **Имя устройства и `manufacturer` в HA discovery** — оставлено
+   «Garage Light x16». Если вы используете другой вендор — расскажите,
+   заполню.
+2. **PIR→active source** vs **PIR→Main always**. Принято второе
+   (то есть PIR теперь поднимает тот источник, который сейчас в `mode`).
+   Это упрощает UX. Если в вашей инсталляции PIR должен поднимать только
+   Main — скажите, переключим.
+3. **Идентификация** — `device.identifiers = ["garage_light_x1_6"]`
+   жёстко выкован. Если у вас несколько гаражей или несколько таких плат —
+   переключаемся на `chipid` динамически и добавляем миграцию retained.

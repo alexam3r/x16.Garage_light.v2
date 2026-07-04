@@ -1,61 +1,71 @@
 // src/main.cpp — прошивка контроллера света в гараже.
-// ESP8266 + PubSubClient. Весь код проекта в одном файле, кроме
-// Config.h и Secrets.h. Логика старается повторять исходную Lua-версию
-// из docs/lua-original/main.lua и соседних файлов.
+// ESP8266 + PubSubClient 2.x + ArduinoJson 7.x.
 //
-// Дерево топиков MQTT:
-//   garage/light/<leaf>                ← общее (light, lightMoveDetection и т. п.)
-//   garage/light/<clntid>/<leaf>       ← per-device (state, heap, uptime)
+// Структура MQTT — плоское дерево garage/light/<leaf>, без <clntid>.
+// Подробное описание и таблица топиков — README.md.
+//
+// В src/ лежат только Config.h и Secrets.h(.sample). Весь код прошивки
+// в одном файле.
 
 #include <Arduino.h>
 #include <Ticker.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include <Wire.h>
+#include <ArduinoJson.h>
 
 #include "Config.h"
 #include "Secrets.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Глобальное состояние — аналог Lua `dat`.
+// Глобальное состояние
 // ─────────────────────────────────────────────────────────────────────────────
 namespace {
 
 struct State {
-    String clntid;
-    String nodetopic;
-    String topic;
+    // Сетевое.
+    String  ip;
+    int     rssi = 0;
 
-    // Состояние света.
-    String  light;          // вход MQTT (ON|OFF)
-    String  lightNow;       // фактическое состояние
-    String  lightSelected;  // MAIN|EDISON
+    // Управление.
+    String  mode;            // MAIN | EDISON | OFF
+    String  lightNow;        // ON | OFF
+    bool    motionArmed;     // true ⇒ PIR триггерит авто-включение
 
-    uint32_t count;
-    uint32_t error_no;
-    bool     broker;
-    String   message;
+    // Сенсоры.
+    float   tempC    = NAN;
+    float   humPct   = NAN;
+
+    // Heartbeat.
+    uint32_t count     = 0;
+    uint32_t errorNo   = 0;   // счётчик ошибок коннекта
+    bool     connected = false;
+
+    void applyMode(String newMode);
+    void applyLight(String target);
 };
 
 State g_state;
 
-void state_begin() {
-    g_state.clntid    = String(ESP.getChipId());
-    g_state.nodetopic = String(TOPIC_BASE) + "/" + g_state.clntid;
-    g_state.topic     = String(TOPIC_BASE);
+void State::applyMode(String newMode) {
+    if (newMode != MODE_MAIN && newMode != MODE_EDISON && newMode != MODE_OFF)
+        return;
+    mode = newMode;
+    // Если свет горит и mode изменился — переключаем активный реле.
+    if (lightNow == LIGHT_ON) applyLight(LIGHT_ON);
+}
 
-    g_state.light         = "OFF";
-    g_state.lightNow      = "OFF";
-    g_state.lightSelected = "MAIN";
-
-    g_state.count    = 0;
-    g_state.error_no = 0;
-    g_state.broker   = false;
-    g_state.message  = "";
+void State::applyLight(String target) {
+    bool wantOn = (target == LIGHT_ON);
+    digitalWrite(PIN_LIGHT_MAIN,
+                 (wantOn && mode == MODE_MAIN) ? HIGH : LOW);
+    digitalWrite(PIN_LIGHT_EDISON,
+                 (wantOn && mode == MODE_EDISON) ? HIGH : LOW);
+    lightNow = wantOn ? LIGHT_ON : LIGHT_OFF;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Логгер — единый префикс [L][uptime][module] message. Заменяет ad-hoc
-// `print()` из оригинала на Lua.
+// Логгер [L][uptime][module] message.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class Logger {
@@ -64,41 +74,89 @@ public:
         Serial.begin(baud);
         delay(50);
     }
-
-    // Модуль — строкой из flash (через F(...)), сообщение — flash или RAM.
     static void info (const __FlashStringHelper* m, const __FlashStringHelper* s) { emit('I', m, String(s)); }
     static void warn (const __FlashStringHelper* m, const __FlashStringHelper* s) { emit('W', m, String(s)); }
     static void error(const __FlashStringHelper* m, const __FlashStringHelper* s) { emit('E', m, String(s)); }
-
     static void info (const __FlashStringHelper* m, const String& s) { emit('I', m, s); }
     static void warn (const __FlashStringHelper* m, const String& s) { emit('W', m, s); }
     static void error(const __FlashStringHelper* m, const String& s) { emit('E', m, s); }
 
 private:
     static void emit(char lvl, const __FlashStringHelper* m, const String& s) {
-        Serial.print('[');
-        Serial.print(lvl);
-        Serial.print(F("]["));
-        Serial.print(millis());
-        Serial.print(F("]["));
-        Serial.print(m);              // На ESP8266 Serial.print умеет PROGMEM-строки.
-        Serial.print(F("] "));
+        Serial.print('['); Serial.print(lvl); Serial.print(F("]["));
+        Serial.print(millis()); Serial.print(F("]["));
+        Serial.print(m); Serial.print(F("] "));
         Serial.println(s);
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Wi-Fi. Сильно напоминает mqttset.lua/mqttget.lua: «не звоним брокеру
-// пока Wi-Fi не поднят».
+// I²C-драйвер AM2320. Простая polling-реализация по даташиту:
+// WAKE (≥800 µs silence) → read regs 0x0000..0x0003 → CRC.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class Am2320 {
+public:
+    bool begin() {
+        // На NodeMCU v2 I²C пины: D1=IO2, D2=IO4 (по документации).
+        Wire.begin(/*sda*/ 2, /*scl*/ 4);
+        return true;
+    }
+
+    bool read(float& tempC, float& humPct) {
+        // 1) «Разбудить» — короткий START-STOP (>800 µs), затем пауза.
+        Wire.beginTransmission(AM2320_ADDR);
+        Wire.endTransmission();
+        delayMicroseconds(1500);
+
+        // 2) Команда чтения регистров 0x0000..0x0003 (hum MSB|LSB, temp MSB|LSB).
+        Wire.beginTransmission(AM2320_ADDR);
+        Wire.write(0x03);                       // function code
+        Wire.write(0x00); Wire.write(0x00);     // start = 0x0000
+        Wire.write(0x00); Wire.write(0x04);     // length = 4 regs
+        if (Wire.endTransmission() != 0) return false;
+        delayMicroseconds(1500);
+
+        // 3) Получаем 8 байт: [func, len, humMSB, humLSB, tempMSB, tempLSB, crclow, crchigh].
+        if (Wire.requestFrom(AM2320_ADDR, (uint8_t)8) != 8) return false;
+        uint8_t buf[8];
+        for (uint8_t i = 0; i < 8; ++i) {
+            if (!Wire.available()) return false;
+            buf[i] = Wire.read();
+        }
+
+        // 4) CRC по даташиту (poly 0xA001).
+        uint16_t crc = 0xFFFF;
+        for (uint8_t i = 0; i < 6; ++i) {
+            crc ^= buf[i];
+            for (uint8_t j = 0; j < 8; ++j) {
+                crc = (crc & 0x01) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
+            }
+        }
+        if ((uint8_t)(crc & 0xFF) != buf[7]) return false;
+        if ((uint8_t)(crc >> 8)   != buf[6]) return false;
+
+        uint16_t humRaw  = ((uint16_t)buf[2] << 8) | buf[3];
+        uint16_t tempRaw = ((uint16_t)buf[4] << 8) | buf[5];
+        humPct = humRaw  / 10.0f;
+        tempC  = tempRaw / 10.0f;
+        return true;
+    }
+
+private:
+    static constexpr uint8_t AM2320_ADDR = 0x5C;
+};
+
+Am2320 g_am2320;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wi-Fi
 // ─────────────────────────────────────────────────────────────────────────────
 
 class WifiManager {
 public:
     void begin(const char* ssid, const char* password) {
-        if (!ssid || !*ssid) {
-            Logger::warn(F("wifi"), F("SSID пустой, пропускаем"));
-            return;
-        }
+        if (!ssid || !*ssid) { Logger::warn(F("wifi"), F("SSID пустой")); return; }
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(true);
         WiFi.persistent(true);
@@ -111,7 +169,9 @@ public:
     void tick() {
         if (_announced) return;
         if (!isConnected()) return;
-        Logger::info(F("wifi"), String(F("connected, ip=")) + WiFi.localIP().toString());
+        g_state.ip   = WiFi.localIP().toString();
+        g_state.rssi = WiFi.RSSI();
+        Logger::info(F("wifi"), String(F("connected, ip=")) + g_state.ip);
         _announced = true;
     }
 
@@ -124,7 +184,7 @@ private:
 // и MqttPublisher, чтобы они виделись как полные типы.
 // ─────────────────────────────────────────────────────────────────────────────
 
-class MqttDispatcher;  // forward
+class MqttDispatcher;
 
 class MqttClient {
 public:
@@ -132,8 +192,8 @@ public:
     void begin(MqttDispatcher& dispatch);
     void tick();
 
-    // Publisher стучится сюда. Универсальная сигнатура работает на
-    // PubSubClient 2.6/2.7/2.8: (topic, const uint8_t*, len, retain).
+    // PubSubClient 2.x: (topic, const uint8_t*, len, retain) — наша единственная
+    // сигнатура с payload-as-string.
     bool publishRaw(const String& topic, const String& payload, bool retain) {
         if (!connected()) return false;
         return _mqtt->publish(topic.c_str(),
@@ -144,35 +204,38 @@ public:
 
 private:
     WiFiClient       _espClient;
-    PubSubClient*    _mqtt      = nullptr;
-    MqttDispatcher*  _dispatch  = nullptr;
-    bool             _want     = false;
-    unsigned long    _retryAtMs = 0;
+    PubSubClient*    _mqtt       = nullptr;
+    MqttDispatcher*  _dispatch   = nullptr;
+    bool             _want       = false;
+    unsigned long    _retryAtMs  = 0;
+    bool             _haDiscoveryPublished = false;
 
     bool doConnect();
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Out-очередь (бывший topub). Одна публикация в полёте, чтобы стек TCP
-// не захлёбывался.
+// Out-очередь. Одна публикация в полёте.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class MqttPublisher {
 public:
     void begin(MqttClient& mqtt) { _mqtt = &mqtt; reset(); }
 
-    // QoS всегда 0 — для телеметрии в LAN этого хватает.
-    void enqueue(const String& leaf, const String& payload, bool retain = false) {
+    void enqueueFullTopic(const String& topic, const String& payload, bool retain = false) {
         if (_size >= QUEUE_CAPACITY) {
             _head = (_head + 1) % QUEUE_CAPACITY;
             --_size;
             Logger::warn(F("pub"), F("queue full, dropped oldest"));
         }
-        _q[_tail].leaf    = leaf;
+        _q[_tail].topic   = topic;
         _q[_tail].payload = payload;
         _q[_tail].retain  = retain;
         _tail = (_tail + 1) % QUEUE_CAPACITY;
         ++_size;
+    }
+
+    void enqueueLeaf(const char* leaf, const String& payload, bool retain = false) {
+        enqueueFullTopic(String(TOPIC_BASE) + "/" + leaf, payload, retain);
     }
 
     void tick() {
@@ -182,7 +245,7 @@ public:
         if (!_mqtt->connected()) return;
 
         Item it = _q[_head];
-        if (!_mqtt->publishRaw(String(g_state.topic) + "/" + it.leaf, it.payload, it.retain)) {
+        if (!_mqtt->publishRaw(it.topic, it.payload, it.retain)) {
             Logger::warn(F("pub"), F("publish failed"));
             return;
         }
@@ -191,28 +254,29 @@ public:
         --_size;
     }
 
+    bool isEmpty() const { return _size == 0; }
+
 private:
     static constexpr size_t QUEUE_CAPACITY = 16;
 
     struct Item {
-        String leaf;
+        String topic;
         String payload;
         bool   retain;
     };
 
     Item        _q[QUEUE_CAPACITY];
-    size_t      _head    = 0;
-    size_t      _tail    = 0;
-    size_t      _size    = 0;
-    bool        _inFlight = false;
-    MqttClient* _mqtt     = nullptr;
+    size_t      _head      = 0;
+    size_t      _tail      = 0;
+    size_t      _size      = 0;
+    bool        _inFlight  = false;
+    MqttClient* _mqtt      = nullptr;
 
     void reset() { _head = _tail = _size = 0; _inFlight = false; }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Dispatcher — таблица обработчиков по последнему сегменту топика (как
-// string.match(topic, './(%w+)$') в mqttanalise.lua).
+// Dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
 
 class MqttDispatcher {
@@ -223,8 +287,6 @@ public:
 
     void begin(const Entry* table, size_t n) { _table = table; _count = n; }
 
-    // Топик и payload всегда копии, потому что буфер PubSubClient
-    // перезаписывается между приёмами.
     void dispatch(const String& topic, const String& payload) {
         for (size_t i = 0; i < _count; ++i) {
             const Entry& e = _table[i];
@@ -248,119 +310,356 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Контроллер света — аналог light()/moveDetected() в Lua main.lua.
-// В этой версии обрабатывает только MQTT-команду ON/OFF; PIR и выбор
-// MAIN/EDISON — следующая итерация.
+// HA discovery publisher — набор конфигов под homeassistant/<plat>/<uid>/config
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace ha {
+
+// Хелпер: положить в JsonObject device общий шаблон.
+void fillDevice(JsonObject dev) {
+    JsonArray ids = dev["identifiers"].to<JsonArray>();
+    ids.add(DEVICE_ID);
+    dev["name"]        = DEVICE_NAME;
+    dev["model"]       = DEVICE_MODEL;
+    dev["manufacturer"]= DEVICE_MANUFACTURER;
+    dev["sw_version"]  = DEVICE_SW_VERSION;
+}
+
+String serializeTo(const JsonDocument& doc) {
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+void publishLightCore(MqttPublisher& publisher) {
+    JsonDocument doc;
+    doc["name"]              = "Garage Light";
+    doc["unique_id"]         = String(DEVICE_ID) + "_light";
+    doc["state_topic"]       = String(TOPIC_BASE) + "/" + LEAF_LIGHT + "/state";
+    doc["command_topic"]     = String(TOPIC_BASE) + "/" + LEAF_LIGHT + "/set";
+    doc["payload_on"]        = LIGHT_ON;
+    doc["payload_off"]       = LIGHT_OFF;
+    doc["availability_topic"]= String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    doc["payload_available"] = LWT_PAYLOAD_ONLINE;
+    doc["payload_not_available"] = LWT_PAYLOAD_OFFLINE;
+    fillDevice(doc["device"].to<JsonObject>());
+    publisher.enqueueFullTopic(
+        String(HA_DISCOVERY_PREFIX) + "/light/" + String(DEVICE_ID) + "_light/config",
+        serializeTo(doc), /*retain*/ true);
+}
+
+void publishSelectMode(MqttPublisher& publisher) {
+    JsonDocument doc;
+    doc["name"]              = "Mode";
+    doc["unique_id"]         = String(DEVICE_ID) + "_mode";
+    doc["state_topic"]       = String(TOPIC_BASE) + "/" + LEAF_MODE + "/state";
+    doc["command_topic"]     = String(TOPIC_BASE) + "/" + LEAF_MODE + "/set";
+    JsonArray opts = doc["options"].to<JsonArray>();
+    opts.add(MODE_MAIN);
+    opts.add(MODE_EDISON);
+    opts.add(MODE_OFF);
+    doc["availability_topic"]= String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    doc["payload_available"] = LWT_PAYLOAD_ONLINE;
+    doc["payload_not_available"] = LWT_PAYLOAD_OFFLINE;
+    fillDevice(doc["device"].to<JsonObject>());
+    publisher.enqueueFullTopic(
+        String(HA_DISCOVERY_PREFIX) + "/select/" + String(DEVICE_ID) + "_mode/config",
+        serializeTo(doc), /*retain*/ true);
+}
+
+void publishMotion(MqttPublisher& publisher) {
+    JsonDocument doc;
+    doc["name"]              = "Motion";
+    doc["unique_id"]         = String(DEVICE_ID) + "_motion";
+    doc["state_topic"]       = String(TOPIC_BASE) + "/" + LEAF_MOTION + "/state";
+    doc["payload_on"]        = MOTION_ON;
+    doc["payload_off"]       = MOTION_OFF;
+    doc["device_class"]      = "motion";
+    doc["availability_topic"]= String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    doc["payload_available"] = LWT_PAYLOAD_ONLINE;
+    doc["payload_not_available"] = LWT_PAYLOAD_OFFLINE;
+    fillDevice(doc["device"].to<JsonObject>());
+    publisher.enqueueFullTopic(
+        String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + String(DEVICE_ID) + "_motion/config",
+        serializeTo(doc), /*retain*/ true);
+}
+
+void publishRestartButton(MqttPublisher& publisher) {
+    JsonDocument doc;
+    doc["name"]              = "Restart";
+    doc["unique_id"]         = String(DEVICE_ID) + "_restart";
+    doc["command_topic"]     = String(TOPIC_BASE) + "/" + LEAF_RESTART + "/set";
+    doc["payload_press"]     = RESTART_CMD;
+    doc["availability_topic"]= String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    doc["payload_available"] = LWT_PAYLOAD_ONLINE;
+    doc["payload_not_available"] = LWT_PAYLOAD_OFFLINE;
+    fillDevice(doc["device"].to<JsonObject>());
+    publisher.enqueueFullTopic(
+        String(HA_DISCOVERY_PREFIX) + "/button/" + String(DEVICE_ID) + "_restart/config",
+        serializeTo(doc), /*retain*/ true);
+}
+
+void publishSensorJson(MqttPublisher& publisher,
+                       const char* entityKey, const char* name,
+                       const char* unit, const char* deviceClass) {
+    JsonDocument doc;
+    doc["name"]              = name;
+    doc["unique_id"]         = String(DEVICE_ID) + "_" + entityKey;
+    doc["state_topic"]       = String(TOPIC_BASE) + "/" + LEAF_STATUS;
+    doc["value_template"]    = String("{{ value_json.") + entityKey + " }}";
+    if (unit)        doc["unit_of_measurement"] = unit;
+    if (deviceClass) doc["device_class"]        = deviceClass;
+    doc["entity_category"]     = "diagnostic";
+    doc["availability_topic"]  = String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    doc["payload_available"]   = LWT_PAYLOAD_ONLINE;
+    doc["payload_not_available"] = LWT_PAYLOAD_OFFLINE;
+    fillDevice(doc["device"].to<JsonObject>());
+    publisher.enqueueFullTopic(
+        String(HA_DISCOVERY_PREFIX) + "/sensor/" + String(DEVICE_ID) + "_" + entityKey + "/config",
+        serializeTo(doc), /*retain*/ true);
+}
+
+void publishSensorPrimary(MqttPublisher& publisher,
+                          const char* entityKey, const char* name,
+                          const char* unit, const char* deviceClass) {
+    JsonDocument doc;
+    doc["name"]              = name;
+    doc["unique_id"]         = String(DEVICE_ID) + "_" + entityKey;
+    doc["state_topic"]       = String(TOPIC_BASE) + "/" + LEAF_STATUS;
+    doc["value_template"]    = String("{{ value_json.") + entityKey + " }}";
+    if (unit)        doc["unit_of_measurement"] = unit;
+    if (deviceClass) doc["device_class"]        = deviceClass;
+    doc["availability_topic"]  = String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    doc["payload_available"]   = LWT_PAYLOAD_ONLINE;
+    doc["payload_not_available"] = LWT_PAYLOAD_OFFLINE;
+    fillDevice(doc["device"].to<JsonObject>());
+    publisher.enqueueFullTopic(
+        String(HA_DISCOVERY_PREFIX) + "/sensor/" + String(DEVICE_ID) + "_" + entityKey + "/config",
+        serializeTo(doc), /*retain*/ true);
+}
+
+void publishAll(MqttPublisher& publisher) {
+    publishLightCore(publisher);
+    publishSelectMode(publisher);
+    publishMotion(publisher);
+    publishRestartButton(publisher);
+    publishSensorPrimary(publisher, "temp_c",  "Temperature", "°C",  "temperature");
+    publishSensorPrimary(publisher, "hum_pct", "Humidity",    "%",   "humidity");
+    publishSensorJson  (publisher, "uptime_s", "Uptime",       "s",   NULL);
+    publishSensorJson  (publisher, "rssi",     "WiFi Signal",  "dBm", "signal_strength");
+    publishSensorJson  (publisher, "ip",       "IP Address",   NULL,  NULL);
+}
+
+}  // namespace ha
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Контроллер света
 // ─────────────────────────────────────────────────────────────────────────────
 
 class LightController {
 public:
-    static LightController* _instance;     // trampoline для Dispatcher.
+    static LightController* _instance;
 
     void begin(MqttPublisher& pub) {
         _pub = &pub;
         _instance = this;
-        setupPins();
-        applyLight("OFF");
+
+        pinMode(PIN_LIGHT_MAIN,   OUTPUT);
+        pinMode(PIN_LIGHT_EDISON, OUTPUT);
+        pinMode(PIN_PIR, INPUT);
+        digitalWrite(PIN_LIGHT_MAIN,   LOW);
+        digitalWrite(PIN_LIGHT_EDISON, LOW);
+
+        g_state.mode         = MODE_MAIN;
+        g_state.lightNow     = LIGHT_OFF;
+        g_state.motionArmed  = true;
+        s_rearmMs     = 0;
+
+        attachInterrupt(digitalPinToInterrupt(PIN_PIR), onPirStatic, RISING);
         Logger::info(F("light"), F("controller ready"));
     }
 
+    // ──── heartbeat tick ────
     void tick() {
+        // Авто-выключение света.
         if (_isOn && _timeoutMs && (millis() - _onSinceMs >= _timeoutMs)) {
             Logger::info(F("light"), F("auto-off"));
-            cmd("OFF", /*manual*/ false);
+            applyAndPublish(LIGHT_OFF);
+        }
+        // Auto re-arm motion.
+        if (!g_state.motionArmed && s_rearmMs && millis() >= s_rearmMs) {
+            g_state.motionArmed = true;
+            attachInterrupt(digitalPinToInterrupt(PIN_PIR), onPirStatic, RISING);
+            publishMotionState();
+            Logger::info(F("motion"), F("auto re-armed"));
+            s_rearmMs = 0;
         }
     }
 
-    static void onLightCommandStatic(const String& payload) {
+    // ──── Публикация текущих значений (через _pub) ────
+    void publishLightState()  {
+        if (!_pub) return;
+        _pub->enqueueLeaf(LEAF_LIGHT, g_state.lightNow, /*retain*/ true);
+    }
+    void publishModeState() {
+        if (!_pub) return;
+        _pub->enqueueLeaf(LEAF_MODE, g_state.mode, /*retain*/ true);
+    }
+    void publishMotionState() {
+        if (!_pub) return;
+        _pub->enqueueLeaf(LEAF_MOTION,
+                          g_state.motionArmed ? String(MOTION_ON) : String(MOTION_OFF),
+                          /*retain*/ true);
+    }
+
+    // ──── Команды от MQTT ────
+    static void onLightSetStatic(const String& payload) {
         if (!_instance) return;
-        // Lua mqttanalise.lua: `if itm[2] ~= dat.light then dat.light = itm[2]; …`.
-        if (payload == g_state.light) return;
-        g_state.light = payload;
-        _instance->cmd(payload, /*manual*/ true);
+        if (payload == LIGHT_ON)        _instance->onTurnOn(/*fromMotion*/ false);
+        else if (payload == LIGHT_OFF)  _instance->onTurnOff();
+        else                            Logger::warn(F("light"), String(F("bad payload: ")) + payload);
+    }
+    static void onModeSetStatic(const String& payload) {
+        if (!_instance) return;
+        if (payload != MODE_MAIN && payload != MODE_EDISON && payload != MODE_OFF) {
+            Logger::warn(F("mode"), String(F("bad payload: ")) + payload);
+            return;
+        }
+        g_state.applyMode(payload);
+        _instance->publishModeState();
+        if (g_state.mode == MODE_OFF && g_state.lightNow == LIGHT_ON) {
+            _instance->onTurnOff();
+        }
+        Logger::info(F("mode"), String(F("now ")) + g_state.mode);
+    }
+    static void onMotionSetStatic(const String& payload) {
+        if (!_instance) return;
+        if (payload == MOTION_OFF) {
+            if (g_state.motionArmed) {
+                g_state.motionArmed = false;
+                detachInterrupt(digitalPinToInterrupt(PIN_PIR));
+                s_rearmMs = millis() + MOTION_REARM_MS;
+                _instance->publishMotionState();
+                Logger::info(F("motion"), F("disarmed"));
+            }
+        } else if (payload == MOTION_ON) {
+            if (!g_state.motionArmed) {
+                g_state.motionArmed = true;
+                attachInterrupt(digitalPinToInterrupt(PIN_PIR), onPirStatic, RISING);
+                s_rearmMs = 0;
+                _instance->publishMotionState();
+                Logger::info(F("motion"), F("armed"));
+            }
+        } else {
+            Logger::warn(F("motion"), String(F("bad payload: ")) + payload);
+        }
+    }
+    static void onRestartSetStatic(const String& payload) {
+        if (!_instance) return;
+        if (payload == RESTART_CMD) {
+            Logger::info(F("reset"), F("by mqtt, restarting…"));
+            delay(100);
+            ESP.restart();
+        }
+    }
+
+    // ──── PIR (call из основного loop через флаг) ────
+    static void IRAM_ATTR onPirStatic() {
+        if (_instance) _instance->s_pirFlag = true;
+    }
+
+    void servicePir() {
+        if (!s_pirFlag) return;
+        s_pirFlag = false;
+        if (!g_state.motionArmed)        return;
+        if (g_state.mode == MODE_OFF)    return;
+
+        // Свет уже горит: если таймер от MQTT — НЕ трогаем, PIR не имеет
+        // права уменьшать уже установленный MQTT-таймаут.
+        if (_isOn && !_fromMotion) {
+            Logger::info(F("motion"), F("ignored (mqtt-timer)"));
+            return;
+        }
+
+        // Либо свет выключен (включаем с motion-таймером), либо свет
+        // горит по motion (продлеваем таймер до 10 минут от сейчас).
+        _isOn       = true;
+        _fromMotion = true;
+        _onSinceMs  = millis();
+        _timeoutMs  = LIGHT_TIMEOUT_MOTION_MS;
+        applyAndPublish(LIGHT_ON);
+        Logger::info(F("motion"), F("triggered"));
     }
 
 private:
-    MqttPublisher*  _pub        = nullptr;
-    bool            _isOn       = false;
-    unsigned long   _onSinceMs  = 0;
-    unsigned long   _timeoutMs  = 0;
+    static unsigned long  s_rearmMs;
+    static volatile bool  s_pirFlag;
 
-    void setupPins() {
-        pinMode(PIN_LIGHT_MAIN,   OUTPUT);
-        pinMode(PIN_LIGHT_EDISON, OUTPUT);
-        digitalWrite(PIN_LIGHT_MAIN,   LOW);
-        digitalWrite(PIN_LIGHT_EDISON, LOW);
+    MqttPublisher* _pub = nullptr;
+    bool           _isOn = false;
+    bool           _fromMotion = false;    // true ⇒ таймер motion-side, PIR может продлевать
+    unsigned long  _onSinceMs = 0;
+    unsigned long  _timeoutMs = 0;
+
+    void onTurnOn(bool fromMotion) {
+        _isOn       = true;
+        _fromMotion = fromMotion;
+        _onSinceMs  = millis();
+        _timeoutMs  = fromMotion ? LIGHT_TIMEOUT_MOTION_MS : LIGHT_TIMEOUT_MQTT_MS;
+        applyAndPublish(LIGHT_ON);
+    }
+    void onTurnOff() {
+        _isOn       = false;
+        _fromMotion = false;
+        _timeoutMs  = 0;
+        applyAndPublish(LIGHT_OFF);
+        // Независимо от того, какой источник работал до этого —
+        // после выключения mode всегда переходит в MAIN.
+        if (g_state.mode != MODE_MAIN) {
+            g_state.applyMode(MODE_MAIN);
+            publishModeState();
+        }
     }
 
-    // manual=true  ⇒  таймаут 3600s (mqttget.lua при удалённом включении).
-    // manual=false ⇒  таймаут 600s  (после детектирования движения).
-    void cmd(const String& target, bool manual) {
-        _isOn      = (target == "ON");
-        _onSinceMs = millis();
-        _timeoutMs = manual ? LIGHT_TIMEOUT_MQTT_MS : LIGHT_TIMEOUT_DEFAULT_MS;
-        applyLight(target);
-        if (_pub) {
-            _pub->enqueue("light",    target, /*retain*/ true);
-            _pub->enqueue("lightNow", target, /*retain*/ false);
-        }
-        Logger::info(F("light"), manual ? F("manual") : F("motion"));
-    }
-
-    void applyLight(const String& target) {
-        if (target == "ON") {
-            if (g_state.lightSelected == "MAIN") {
-                digitalWrite(PIN_LIGHT_MAIN,   HIGH);
-                digitalWrite(PIN_LIGHT_EDISON, LOW);
-            } else {
-                digitalWrite(PIN_LIGHT_MAIN,   LOW);
-                digitalWrite(PIN_LIGHT_EDISON, HIGH);
-            }
-            g_state.lightNow = "ON";
-        } else {
-            digitalWrite(PIN_LIGHT_MAIN,   LOW);
-            digitalWrite(PIN_LIGHT_EDISON, LOW);
-            g_state.lightNow = "OFF";
-        }
+    // Общий путь: пины + state + republish.
+    void applyAndPublish(const String& target) {
+        g_state.applyLight(target);
+        publishLightState();
     }
 };
 
 LightController* LightController::_instance = nullptr;
+unsigned long  LightController::s_rearmMs   = 0;
+volatile bool  LightController::s_pirFlag  = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Глобальный композит — синглтоны, видимые и в setup()/loop().
+// singleton-объекты
 // ─────────────────────────────────────────────────────────────────────────────
 
-WifiManager       g_wifi;
-MqttPublisher     g_publisher;
-MqttClient        g_mqtt;
-MqttDispatcher    g_dispatch;
-LightController   g_light;
+WifiManager      g_wifi;
+MqttPublisher    g_publisher;
+MqttClient       g_mqtt;
+MqttDispatcher   g_dispatch;
+LightController  g_light;
 
 const MqttDispatcher::Entry kDispatchTable[] = {
-    { "light", &LightController::onLightCommandStatic },
+    { "light/set",       &LightController::onLightSetStatic },
+    { "mode/set",        &LightController::onModeSetStatic },
+    { "motion/set",      &LightController::onMotionSetStatic },
+    { "restart/set",     &LightController::onRestartSetStatic },
 };
 constexpr size_t kDispatchTableSize = sizeof(kDispatchTable) / sizeof(kDispatchTable[0]);
 
-Ticker heartbeat;
-
-void heartbeat1Hz() {
-    ++g_state.count;
-    // Lua main.lua: раз в 60 тиков публикуем heap/uptime через g_publisher.
-    if (g_state.count % HEARTBEAT_DIAG_PERIOD == 0) {
-        g_publisher.enqueue(String(g_state.clntid) + "/heap",   String(ESP.getFreeHeap()),     /*retain*/ false);
-        g_publisher.enqueue(String(g_state.clntid) + "/uptime", String(millis() / 1000UL),    /*retain*/ false);
-    }
-}
+Ticker tick_;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Тело MqttClient. Сейчас видны MqttDispatcher и Loger как полные типы.
+// Тело MqttClient (после полного определения)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static MqttDispatcher* g_dispatcher = nullptr;
 
 void MqttClient::begin(MqttDispatcher& dispatch) {
-    _dispatch = &dispatch;
+    _dispatch    = &dispatch;
     g_dispatcher = &dispatch;
 
     _mqtt = new PubSubClient(_espClient);
@@ -379,43 +678,56 @@ void MqttClient::begin(MqttDispatcher& dispatch) {
 
     _want     = true;
     _retryAtMs = millis() + 250;
+    Logger::info(F("mqtt"), F("client ready"));
 }
 
 bool MqttClient::doConnect() {
     if (!WiFi.isConnected()) return false;
 
-    String lwt = g_state.nodetopic + "/state";
-    bool ok = _mqtt->connect(g_state.clntid.c_str(),
-                             MQTT_USER, MQTT_PASSWORD,
-                             lwt.c_str(),
-                             /*willQos*/ 0,
-                             /*willRetain*/ true,
-                             LWT_PAYLOAD_OFFLINE,
-                             /*cleanSession*/ true);
+    String lwtTopic = String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    bool ok = _mqtt->connect(
+        /*clientId*/  "garage_light",
+        /*user*/      MQTT_USER,
+        /*pass*/      MQTT_PASSWORD,
+        /*willTopic*/ lwtTopic.c_str(),
+        /*willQos*/   0,
+        /*willRetain*/true,
+        /*willMsg*/   LWT_PAYLOAD_OFFLINE,
+        /*clean*/     true);
     if (!ok) {
         String s = F("rc="); s += _mqtt->state();
         Logger::warn(F("mqtt"), s);
         return false;
     }
+    Logger::info(F("mqtt"), F("connected"));
 
-    Logger::info(F("mqtt"), F("connected to broker"));
-
-    // Подписки — те же 6 топиков, что в mqttget.lua.
     char buf[64];
-    snprintf(buf, sizeof buf, "%s/light",              g_state.topic.c_str());     _mqtt->subscribe(buf, 0);
-    snprintf(buf, sizeof buf, "%s/lightNow",           g_state.topic.c_str());     _mqtt->subscribe(buf, 0);
-    snprintf(buf, sizeof buf, "%s/lightSelected",      g_state.topic.c_str());     _mqtt->subscribe(buf, 0);
-    snprintf(buf, sizeof buf, "%s/lightMoveDetection", g_state.topic.c_str());     _mqtt->subscribe(buf, 0);
-    snprintf(buf, sizeof buf, "%s/ide",                g_state.nodetopic.c_str()); _mqtt->subscribe(buf, 0);
-    snprintf(buf, sizeof buf, "%s/restart",            g_state.nodetopic.c_str()); _mqtt->subscribe(buf, 0);
+    snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_LIGHT);
+    _mqtt->subscribe(buf, 0);
+    snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_MODE);
+    _mqtt->subscribe(buf, 0);
+    snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_MOTION);
+    _mqtt->subscribe(buf, 0);
+    snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_RESTART);
+    _mqtt->subscribe(buf, 0);
     Logger::info(F("mqtt"), F("subscribed"));
 
-    // LWT-birth (mqttget.lua: `m:publish(…, "ON", 2, 1)`).
-    String stateTopic = g_state.nodetopic + "/state";
-    _mqtt->publish(stateTopic.c_str(),
-                   (const uint8_t*)LWT_PAYLOAD_ONLINE,
-                   strlen(LWT_PAYLOAD_ONLINE),
-                   /*retain*/ true);
+    // LWT-birth (retain 'online').
+    publishRaw(lwtTopic, LWT_PAYLOAD_ONLINE, true);
+
+    // Retain текущие state-значения.
+    g_light.publishLightState();
+    g_light.publishModeState();
+    g_light.publishMotionState();
+
+    // HA discovery.
+    if (CFG_ENABLE_HA_DISCOVERY && !_haDiscoveryPublished) {
+        ha::publishAll(g_publisher);
+        _haDiscoveryPublished = true;
+    }
+
+    g_state.connected = true;
+    g_state.errorNo   = 0;
     return true;
 }
 
@@ -424,51 +736,99 @@ void MqttClient::tick() {
     _mqtt->loop();
 
     if (connected()) {
-        if (!g_state.broker) {
-            g_state.broker   = true;
-            g_state.error_no = 0;
+        if (!g_state.connected) {
+            g_state.connected = true;
+            g_state.errorNo   = 0;
         }
         return;
     }
+    if (g_state.connected) {
+        g_state.connected = false;
+        Logger::warn(F("mqtt"), F("disconnected"));
+    }
 
-    if (g_state.broker) g_state.broker = false;
+    if (!_want)                  return;
+    if (millis() < _retryAtMs)   return;
 
-    if (!_want) return;
-    if (millis() < _retryAtMs) return;
+    if (doConnect()) { _want = false; return; }
 
-    if (doConnect()) {
-        _want = false;
-    } else {
-        ++g_state.error_no;
-        unsigned long backoff = 1000UL << g_state.error_no;
-        if (backoff > 30000UL) backoff = 30000UL;
-        _retryAtMs = millis() + backoff;
-        String m = F("retry in ms="); m += backoff;
-        Logger::warn(F("mqtt"), m);
+    if (g_state.errorNo < UINT32_MAX) ++g_state.errorNo;
+    unsigned long backoff = 1000UL << g_state.errorNo;
+    if (backoff > 30000UL) backoff = 30000UL;
+    _retryAtMs = millis() + backoff;
+    String m = F("retry in ms="); m += backoff;
+    Logger::warn(F("mqtt"), m);
+}
+
+// Формирует JSON status.
+static void publishStatusJson() {
+    JsonDocument doc;
+    doc["available"]    = g_state.connected;
+    doc["uptime_s"]     = (uint32_t)(millis() / 1000UL);
+    doc["rssi"]         = g_state.rssi;
+    doc["ip"]           = g_state.ip;
+    doc["mode"]         = g_state.mode;
+    if (CFG_ENABLE_AM2320 && !isnan(g_state.tempC))  doc["temp_c"]  = g_state.tempC;
+    if (CFG_ENABLE_AM2320 && !isnan(g_state.humPct)) doc["hum_pct"] = g_state.humPct;
+
+    String out;
+    serializeJson(doc, out);
+    g_publisher.enqueueLeaf(LEAF_STATUS, out, /*retain*/ true);
+}
+
+}  // namespace  // anom
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Heartbeat-функция вне anom (для Ticker нужен без захвата).
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void heartbeat() {
+    ++g_state.count;
+    g_light.servicePir();
+
+    if (g_state.count % HEARTBEAT_STATUS_PERIOD == 0) {
+        if (CFG_ENABLE_AM2320) {
+            float t = NAN, h = NAN;
+            if (g_am2320.read(t, h)) {
+                g_state.tempC  = t;
+                g_state.humPct = h;
+            } else {
+                Logger::warn(F("am2320"), F("read failed"));
+            }
+        }
+        publishStatusJson();
     }
 }
 
-}  // namespace
-
 // ─────────────────────────────────────────────────────────────────────────────
-// setup()/loop() — снаружи анонимного namespace, чтобы платформа видела
-// символы как глобальные.
+// setup()/loop()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
     Logger::begin();
     Logger::info(F("boot"), F("starting x16 garage light"));
 
-    state_begin();
+    g_state.ip            = "";
+    g_state.rssi          = 0;
+    g_state.mode          = MODE_MAIN;
+    g_state.lightNow      = LIGHT_OFF;
+    g_state.motionArmed   = true;
+    g_state.tempC         = NAN;
+    g_state.humPct        = NAN;
+    g_state.count         = 0;
+    g_state.errorNo       = 0;
+    g_state.connected     = false;
+
+    if (CFG_ENABLE_AM2320) g_am2320.begin();
 
     g_wifi.begin(WIFI_SSID, WIFI_PASSWORD);
     g_publisher.begin(g_mqtt);
-    g_light.begin(g_publisher);   // внутри ставит LightController::_instance = &g_light
+    g_light.begin(g_publisher);
 
     g_dispatch.begin(kDispatchTable, kDispatchTableSize);
     g_mqtt.begin(g_dispatch);
 
-    heartbeat.attach_ms(HEARTBEAT_PERIOD_MS, heartbeat1Hz);
+    tick_.attach_ms(HEARTBEAT_PERIOD_MS, ::heartbeat);
     Logger::info(F("boot"), F("setup complete"));
 }
 
