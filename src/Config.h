@@ -37,15 +37,20 @@
 #define CFG_PUBLISH_STATUS_JSON       1
 #endif
 
-// HTTP-recovery и OTA. По умолчанию выключено — следующая итерация.
-#ifndef CFG_ENABLE_HTTP_RECOVERY
-#define CFG_ENABLE_HTTP_RECOVERY      0
-#endif
-
 // Legacy Lua-топики (airTemp/hum/light/lightNow/lightSelected/lightMoveDetection)
 // больше НЕ публикуются — отказались от них при переходе на новый layout.
 #ifndef CFG_PUBLISH_LEGACY_TOPICS
 #define CFG_PUBLISH_LEGACY_TOPICS     0
+#endif
+
+// Подробный лог для отладки. По умолчанию 1 — печатает лог каждого
+// интересного события (PIR-триггер, MQTT-команды, автомат выключения,
+// motion re-arm, результат подключения к брокеру). Если ставим 0 —
+// остаются только error/warn, что убирает ~3 КБ из flash и шум в
+// serial-мониторе для продакшен-сборки. Использую макросы VLOG_I/W/E
+// вместо Logger::info/warn/error там, где это детальная диагностика.
+#ifndef CFG_VERBOSE_LOG
+#define CFG_VERBOSE_LOG               1
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────

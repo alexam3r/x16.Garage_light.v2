@@ -66,6 +66,8 @@ void State::applyLight(String target) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Логгер [L][uptime][module] message.
+// При включённом CFG_VERBOSE_LOG доступны макросы VLOG_I/W/E для
+// подробной диагностики. Иначе они компилируются в no-op (= 0 flash).
 // ─────────────────────────────────────────────────────────────────────────────
 
 class Logger {
@@ -89,6 +91,16 @@ private:
         Serial.println(s);
     }
 };
+
+#if CFG_VERBOSE_LOG
+#define VLOG_I(m, s) Logger::info((m), (s))
+#define VLOG_W(m, s) Logger::warn((m), (s))
+#define VLOG_E(m, s) Logger::error((m), (s))
+#else
+#define VLOG_I(m, s) do {} while (0)
+#define VLOG_W(m, s) do {} while (0)
+#define VLOG_E(m, s) do {} while (0)
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // I²C-драйвер AM2320. Простая polling-реализация по даташиту:
@@ -481,13 +493,23 @@ public:
 
     // ──── heartbeat tick ────
     void tick() {
+        // Диагностика: состояние таймера и сервиса.
+        if (_isOn) {
+            unsigned long left = (_timeoutMs == 0) ? 0 : (_timeoutMs - (millis() - _onSinceMs));
+            VLOG_I(F("tick"), String(F("isOn=on; fromMotion=")) + (_fromMotion ? F("y") : F("n")) + F("; timeleftMs=") + left);
+        }
+
         // Авто-выключение света.
         if (_isOn && _timeoutMs && (millis() - _onSinceMs >= _timeoutMs)) {
+            unsigned long delta = millis() - _onSinceMs;
+            VLOG_I(F("tick"), String(F("autooff: elapsedMs=")) + delta + F(" budget=") + _timeoutMs);
             Logger::info(F("light"), F("auto-off"));
             applyAndPublish(LIGHT_OFF);
         }
         // Auto re-arm motion.
         if (!g_state.motionArmed && s_rearmMs && millis() >= s_rearmMs) {
+            unsigned long delta = millis() - s_rearmMs;
+            VLOG_I(F("tick"), String(F("motionRearm: elapsedMs=")) + delta);
             g_state.motionArmed = true;
             attachInterrupt(digitalPinToInterrupt(PIN_PIR), onPirStatic, RISING);
             publishMotionState();
@@ -514,25 +536,30 @@ public:
 
     // ──── Команды от MQTT ────
     static void onLightSetStatic(const String& payload) {
+        VLOG_I(F("mqtt"), String(F("light/set=")) + payload);
         if (!_instance) return;
         if (payload == LIGHT_ON)        _instance->onTurnOn(/*fromMotion*/ false);
         else if (payload == LIGHT_OFF)  _instance->onTurnOff();
         else                            Logger::warn(F("light"), String(F("bad payload: ")) + payload);
     }
     static void onModeSetStatic(const String& payload) {
+        VLOG_I(F("mqtt"), String(F("mode/set=")) + payload);
         if (!_instance) return;
         if (payload != MODE_MAIN && payload != MODE_EDISON && payload != MODE_OFF) {
             Logger::warn(F("mode"), String(F("bad payload: ")) + payload);
             return;
         }
+        String prev = g_state.mode;
         g_state.applyMode(payload);
         _instance->publishModeState();
+        VLOG_I(F("mode"), String(F("apply: ")) + prev + F(" -> ") + g_state.mode);
         if (g_state.mode == MODE_OFF && g_state.lightNow == LIGHT_ON) {
             _instance->onTurnOff();
         }
         Logger::info(F("mode"), String(F("now ")) + g_state.mode);
     }
     static void onMotionSetStatic(const String& payload) {
+        VLOG_I(F("mqtt"), String(F("motion/set=")) + payload);
         if (!_instance) return;
         if (payload == MOTION_OFF) {
             if (g_state.motionArmed) {
@@ -555,6 +582,7 @@ public:
         }
     }
     static void onRestartSetStatic(const String& payload) {
+        VLOG_I(F("mqtt"), String(F("restart/set=")) + payload);
         if (!_instance) return;
         if (payload == RESTART_CMD) {
             Logger::info(F("reset"), F("by mqtt, restarting…"));
@@ -569,14 +597,23 @@ public:
     }
 
     void servicePir() {
-        if (!s_pirFlag) return;
+        if (!s_pirFlag) {
+            // Не печатаем ничего на каждом тике — пусто — это шум.
+            return;
+        }
         s_pirFlag = false;
+        VLOG_I(F("pir"), String(F("flagged: armed=")) + (g_state.motionArmed ? 'y' : 'n') +
+                       F(" mode=") + g_state.mode +
+                       F(" isOn=") + (g_state.lightNow == LIGHT_ON ? 'y' : 'n') +
+                       F(" fromMotion=") + (_fromMotion ? 'y' : 'n'));
+
         if (!g_state.motionArmed)        return;
-        if (g_state.mode == MODE_OFF)    return;
+        if (g_state.mode == MODE_OFF)    { VLOG_I(F("pir"), F("ignored (mode=OFF)")); return; }
 
         // Свет уже горит: если таймер от MQTT — НЕ трогаем, PIR не имеет
         // права уменьшать уже установленный MQTT-таймаут.
         if (_isOn && !_fromMotion) {
+            VLOG_I(F("pir"), F("ignored (mqtt-timer held)"));
             Logger::info(F("motion"), F("ignored (mqtt-timer)"));
             return;
         }
@@ -588,6 +625,7 @@ public:
         _onSinceMs  = millis();
         _timeoutMs  = LIGHT_TIMEOUT_MOTION_MS;
         applyAndPublish(LIGHT_ON);
+        VLOG_I(F("pir"), F("on (motion timer 10min)"));
         Logger::info(F("motion"), F("triggered"));
     }
 
@@ -606,9 +644,12 @@ private:
         _fromMotion = fromMotion;
         _onSinceMs  = millis();
         _timeoutMs  = fromMotion ? LIGHT_TIMEOUT_MOTION_MS : LIGHT_TIMEOUT_MQTT_MS;
+        VLOG_I(F("light"), String(F("onTurnOn: from=")) + (fromMotion ? F("motion") : F("mqtt")) +
+                       F(" timeoutMs=") + _timeoutMs);
         applyAndPublish(LIGHT_ON);
     }
     void onTurnOff() {
+        VLOG_I(F("light"), String(F("onTurnOff: was-fromMotion=")) + (_fromMotion ? 'y' : 'n'));
         _isOn       = false;
         _fromMotion = false;
         _timeoutMs  = 0;
@@ -616,13 +657,18 @@ private:
         // Независимо от того, какой источник работал до этого —
         // после выключения mode всегда переходит в MAIN.
         if (g_state.mode != MODE_MAIN) {
+            String prev = g_state.mode;
             g_state.applyMode(MODE_MAIN);
             publishModeState();
+            VLOG_I(F("mode"), String(F("auto-reset: ")) + prev + F(" -> MAIN"));
         }
     }
 
     // Общий путь: пины + state + republish.
     void applyAndPublish(const String& target) {
+        VLOG_I(F("light"), String(F("apply: ")) + target + F(" mode=") + g_state.mode +
+                       F(" main=") + (digitalRead(PIN_LIGHT_MAIN) ? "1" : "0") +
+                       F(" edison=") + (digitalRead(PIN_LIGHT_EDISON) ? "1" : "0"));
         g_state.applyLight(target);
         publishLightState();
     }
@@ -682,9 +728,14 @@ void MqttClient::begin(MqttDispatcher& dispatch) {
 }
 
 bool MqttClient::doConnect() {
-    if (!WiFi.isConnected()) return false;
+    if (!WiFi.isConnected()) {
+        VLOG_I(F("mqtt"), F("try: WiFi not up yet"));
+        return false;
+    }
 
     String lwtTopic = String(TOPIC_BASE) + "/" + LEAF_AVAILABILITY;
+    VLOG_I(F("mqtt"), String(F("connect: broker=")) + String(MQTT_BROKER) +
+                   F(":") + MQTT_PORT + F(" clientId=garage_light"));
     bool ok = _mqtt->connect(
         /*clientId*/  "garage_light",
         /*user*/      MQTT_USER,
@@ -695,24 +746,31 @@ bool MqttClient::doConnect() {
         /*willMsg*/   LWT_PAYLOAD_OFFLINE,
         /*clean*/     true);
     if (!ok) {
-        String s = F("rc="); s += _mqtt->state();
+        String s = F("connect FAIL rc="); s += _mqtt->state();
         Logger::warn(F("mqtt"), s);
+        VLOG_I(F("mqtt"), s);
         return false;
     }
     Logger::info(F("mqtt"), F("connected"));
+    VLOG_I(F("mqtt"), F("connected OK, subscribing…"));
 
     char buf[64];
     snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_LIGHT);
+    VLOG_I(F("mqtt"), String(F("subscribe: ")) + buf);
     _mqtt->subscribe(buf, 0);
     snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_MODE);
+    VLOG_I(F("mqtt"), String(F("subscribe: ")) + buf);
     _mqtt->subscribe(buf, 0);
     snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_MOTION);
+    VLOG_I(F("mqtt"), String(F("subscribe: ")) + buf);
     _mqtt->subscribe(buf, 0);
     snprintf(buf, sizeof buf, "%s/%s/set", TOPIC_BASE, LEAF_RESTART);
+    VLOG_I(F("mqtt"), String(F("subscribe: ")) + buf);
     _mqtt->subscribe(buf, 0);
     Logger::info(F("mqtt"), F("subscribed"));
 
     // LWT-birth (retain 'online').
+    VLOG_I(F("mqtt"), String(F("publish LWT-birth: ")) + lwtTopic + F(" = online (retain)"));
     publishRaw(lwtTopic, LWT_PAYLOAD_ONLINE, true);
 
     // Retain текущие state-значения.
@@ -722,6 +780,7 @@ bool MqttClient::doConnect() {
 
     // HA discovery.
     if (CFG_ENABLE_HA_DISCOVERY && !_haDiscoveryPublished) {
+        VLOG_I(F("mqtt"), F("publishing HA discovery configs…"));
         ha::publishAll(g_publisher);
         _haDiscoveryPublished = true;
     }
@@ -739,17 +798,20 @@ void MqttClient::tick() {
         if (!g_state.connected) {
             g_state.connected = true;
             g_state.errorNo   = 0;
+            VLOG_I(F("mqtt"), F("state: online"));
         }
         return;
     }
     if (g_state.connected) {
         g_state.connected = false;
+        VLOG_I(F("mqtt"), F("state: offline"));
         Logger::warn(F("mqtt"), F("disconnected"));
     }
 
     if (!_want)                  return;
     if (millis() < _retryAtMs)   return;
 
+    VLOG_I(F("mqtt"), String(F("retry: errorNo=")) + g_state.errorNo);
     if (doConnect()) { _want = false; return; }
 
     if (g_state.errorNo < UINT32_MAX) ++g_state.errorNo;
